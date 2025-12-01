@@ -318,7 +318,7 @@ def execute_workflow(name, phase="train", batch_size=32, epochs=5, learning_rate
                     
                     y = y.float().to(device)
 
-                    if mixup == True and epoch < 7:
+                      if mixup == True:
                         lam = np.random.beta(alpha, alpha)
                         
                         index = torch.randperm(y.size(0)).to(device)
