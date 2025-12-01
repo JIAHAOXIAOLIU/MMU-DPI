@@ -3,7 +3,7 @@ import time
 import datetime
 import random
 
-import pandas as pd # 确保 pandas 已导入
+import pandas as pd 
 from sklearn.model_selection import StratifiedKFold
 from DeepPurpose import utils
 
@@ -220,6 +220,7 @@ def execute_workflow(name, phase="train", batch_size=32, epochs=5, learning_rate
     check_dir(model_path)
     check_dir(log_path)
     log_fd = logger.add(log_path + "/train.log")
+
     data_dti = DTI(name=name)
 
     if name in "DAVIS":
@@ -261,40 +262,31 @@ def execute_workflow(name, phase="train", batch_size=32, epochs=5, learning_rate
 
         df_train = df_raw.iloc[train_index].reset_index(drop=True)
         df_val = df_raw.iloc[val_index].reset_index(drop=True)
+
         logger.info(f"Fold {fold+1}: Balancing Train Set...")
         df_train = preprocess_data(df_train, oversampling=False, undersampling=True) 
         df_val = df_val.dropna() 
+
         logger.info(f"Fold {fold+1}: Constructing Graph from Training Edges only...")
         
-      
         edges_unordered = df_train[['Drug_ID', 'Target_ID']].values
-        
-       
         edges = []
         for row in edges_unordered:
-          
             if row[0] in idx_map and row[1] in idx_map:
                 edges.append([idx_map[row[0]], idx_map[row[1]]])
         edges = np.array(edges)
 
-       
         adj = sp.coo_matrix((np.ones(edges.shape[0]), (edges[:, 0], edges[:, 1])),
                             shape=(idx_total, idx_total),
                             dtype=np.float32)
-        
-        
         adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
-        
-        
         propagation_matrix = create_propagator_matrix(adj, device)
 
-        
         df_train_processed = process_dti_data(df_train)
         df_val_processed = process_dti_data(df_val)
 
         logger.info(f'Fold {fold + 1}: train samples {len(df_train_processed)}, val samples {len(df_val_processed)}')
 
-      
         train_params = {'batch_size': batch_size, 'shuffle': True, 'drop_last': True, 'collate_fn': utils.mpnn_collate_func}
         test_params = {'batch_size': batch_size, 'shuffle': False, 'drop_last': True, 'collate_fn': utils.mpnn_collate_func}
 
@@ -303,86 +295,90 @@ def execute_workflow(name, phase="train", batch_size=32, epochs=5, learning_rate
         valid_dataset = DTIDataset(idx_map, df_val_processed)
         valid_loader = data.DataLoader(valid_dataset, **test_params)
 
-       
         mpnn_model = get_model().model.to(device)
         feature_number = features["dimensions"][1]
         bgat_model = MixHopNetwork(feature_number).to(device)
         
-       
         model = DualModelNetwork(mpnn_model, bgat_model, propagation_matrix, features).to(device)
 
         optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
         scheduler = lr_scheduler.StepLR(optimizer, step_size=lr_step_size, gamma=0.1)
 
-      
         if phase == 'train':
             logger.info(f'Start Training Fold {fold + 1}...')
             t_total = time.time()
+            
             for epoch in range(epochs):
                 alpha = 2
-                lam = np.random.beta(alpha, alpha)
                 epoch_loss = 0
-                batch_total = len(train_loader)
+                model.train() 
                 
-                model.train() # 确保开启训练模式
-                
-                # 训练 Batch 循环
-                for i in tqdm(range(batch_total), f"Fold {fold + 1}, Epoch {epoch + 1}"):
-                    data_iter = iter(train_loader)
-                    batch_current = next(data_iter)
-                    v_d, v_p, y, idx_1, idx_2, label = batch_current
+                for i, batch_data in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Fold {fold + 1}, Epoch {epoch + 1}"):
+                    v_d, v_p, y, idx_1, idx_2, label = batch_data
                     
-                    # Mixup 处理逻辑 (如果有下一批次)
-                    try:
-                        batch_next = next(data_iter)
-                        v_d2, v_p2, y2, idx_12, idx_22, label2 = batch_next
-                        if mixup == True and epoch < 7:
-                             y = lam * y + (1 - lam) * y2
-                    except StopIteration:
-                        pass # 处理最后一个 batch 的边界情况
+                    y = y.float().to(device)
+
+                    if mixup == True and epoch < 7:
+                        lam = np.random.beta(alpha, alpha)
+                        
+                        index = torch.randperm(y.size(0)).to(device)
+                        
+                        y2 = y[index]
+                        mixed_y = lam * y + (1 - lam) * y2
+                        
+                        pred = model(v_d, v_p, idx_1, idx_2).to(device)
+                        pred = pred.flatten()
+                        
+                        loss = torch.nn.functional.binary_cross_entropy_with_logits(pred, mixed_y)
+                    
+                    else:
+                        pred = model(v_d, v_p, idx_1, idx_2).to(device)
+                        pred = pred.flatten()
+                        loss = torch.nn.functional.binary_cross_entropy_with_logits(pred, y)
 
                     optimizer.zero_grad()
-                    pred = model(v_d, v_p, idx_1, idx_2).to(device)
-                    
-                    pred = pred.flatten().to(device)
-                    label = y.float().to(device)
-                    loss = torch.nn.functional.binary_cross_entropy_with_logits(pred, label)
                     loss.backward()
                     optimizer.step()
+                    
                     epoch_loss += loss.item()
                     
                     csv_record(csv_path + "loss.csv",
                                {'fold': fold + 1, 'epoch': epoch + 1, 'batch': i, 'loss': loss.item(),
                                 'avg_loss': epoch_loss / (i + 1)})
 
-               
                 save_model(model, model_path + f"train_{name}_fold{fold + 1}_epoch{epoch + 1}.pt")
                 scheduler.step()
 
                 result = evaluate_model(model, valid_loader, batch_size)
                 result['fold'] = fold + 1
                 result['epoch'] = epoch + 1
-                result['epoch_loss'] = epoch_loss / batch_total
+                result['epoch_loss'] = epoch_loss / len(train_loader)
                 result['lr'] = optimizer.state_dict()['param_groups'][0]['lr']
                 csv_record(csv_path + "train_val_metrics.csv", result)
                 logger.info(f'Fold {fold + 1} Epoch {epoch + 1} Val Metrics: {result}')
 
             logger.info(f"Fold {fold + 1} Optimization Finished!")
+            logger.info("Total time elapsed: {:.4f}s".format(time.time() - t_total))
 
         final_fold_result = evaluate_model(model, valid_loader, batch_size)
         final_fold_result['fold'] = fold + 1
+        logger.info(f"--- Fold {fold + 1} Final Result: {final_fold_result} ---")
         all_fold_results.append(final_fold_result)
         csv_record(csv_path + "fold_final_metrics.csv", final_fold_result)
 
     logger.info("--- 10-Fold Cross-Validation Finished ---")
     df_results = pd.DataFrame(all_fold_results)
+
     avg_results = df_results.mean().to_dict()
     std_results = df_results.std().to_dict()
+
     logger.info(f"Average CV Results: {avg_results}")
+    logger.info(f"Std Dev CV Results: {std_results}")
+
     csv_record(csv_path + "final_avg_metrics.csv", avg_results)
     csv_record(csv_path + "final_std_metrics.csv", std_results)
+
     logger.remove(log_fd)
 
 if __name__ == '__main__':
     execute_workflow('DAVIS')
-    
